@@ -1,7 +1,6 @@
-# BIL304-OTA-Project
-# BIL304 — OTA (Over-The-Air) Firmware Güncelleme Projesi
+# BIL304 — OTA Firmware Projesi
 
-## 📹 Demo Videosu
+## Demo Videosu
 
 [YouTube video linki buraya eklenecek]
 
@@ -9,7 +8,7 @@
 
 ## Proje Hakkında
 
-Bu projede Contiki-NG işletim sistemi üzerinde çalışan Z1 (MSP430F2617) düğümleri arasında bir OTA firmware aktarım mekanizması geliştirilmiştir. Cooja simülatörü kullanılarak üç düğümlü bir senaryo kurulmuştur.
+Contiki-NG ve Cooja kullanılarak Z1 düğümleri arasında OTA firmware aktarım mekanizması geliştirildi. Üç düğümlü bir simülasyon kuruldu:
 
 | Düğüm | Rol | Firmware |
 |-------|-----|----------|
@@ -17,12 +16,12 @@ Bu projede Contiki-NG işletim sistemi üzerinde çalışan Z1 (MSP430F2617) dü
 | Node 2 | Gönderici | udp-client.z1 |
 | Node 3 | Komşu / yönlendirici | udp-client.z1 |
 
-Node 2 ve Node 3'e aynı firmware yüklenmektedir. Kaynak kodunda `node_id == 2` koşuluyla gönderim işlemi yalnızca Node 2 tarafından yürütülür:
+Node 2 ve Node 3'e aynı firmware yüklenmektedir. Aynı firmware kullanılmasına rağmen `node_id` kontrolü sayesinde yalnızca Node 2 OTA göndericisi olarak çalışmaktadır:
 
 ```c
 if(node_id == 2) {
-    // OTA gönderim işlemi buradan başlar
     total_blocks = (FIRMWARE_PAYLOAD_LEN + OTA_BLOCK_SIZE - 1) / OTA_BLOCK_SIZE;
+    // OTA gönderim buradan başlar
 }
 ```
 
@@ -30,152 +29,94 @@ if(node_id == 2) {
 
 ## Paket Formatı
 
-OTA transferinde her paket sabit boyutlu bir yapı taşır. Bu yapı `ota_packet.h` içinde tanımlanmıştır:
+Her OTA paketi `ota_packet.h` içinde tanımlanmış sabit boyutlu bir yapı taşır:
 
 ```c
 typedef struct __attribute__((packed)) {
-    uint8_t  type;                   // Paket türü
-    uint16_t block_id;               // Blok sıra numarası
-    uint8_t  length;                 // Taşınan veri uzunluğu
-    uint8_t  data[OTA_BLOCK_SIZE];   // Firmware verisi (64 byte)
-    uint16_t checksum;               // CRC-16 bütünlük kodu
+    uint8_t  type;
+    uint16_t block_id;
+    uint8_t  length;
+    uint8_t  data[OTA_BLOCK_SIZE];
+    uint16_t checksum;
 } ota_packet_t;
 ```
 
-| Alan | Boyut | Açıklama |
-|------|-------|----------|
-| type | 1 byte | DATA (0x01), ACK (0x02), NACK (0x03), DONE (0x04) |
-| block_id | 2 byte | Blok sıra numarası, 0'dan başlar |
-| length | 1 byte | Bu blokta taşınan gerçek veri miktarı (max 64 byte) |
-| data | 64 byte | Firmware verisi |
-| checksum | 2 byte | CRC-16/CCITT paket bütünlük kodu |
+| Alan | Açıklama |
+|------|----------|
+| type | DATA, ACK, NACK veya DONE |
+| block_id | Blok numarası |
+| length | Veri uzunluğu |
+| data | Firmware verisi (64 byte) |
+| checksum | CRC-16 değeri |
 
 ---
 
-## Firmware İmajının Hazırlanması
+## Firmware Hazırlama
 
-Aktarılacak `new-firmware.z1` dosyası ELF formatında olup disk üzerinde yaklaşık 129.760 byte yer kaplamaktadır. Bu dosyanın tamamını gönderici düğümün içine gömmek denenmiş ancak Z1'in ~92 KB'lık flash sınırı nedeniyle şu hatayla karşılaşılmıştır:
+Başlangıçta `new-firmware.z1` dosyasının tamamını (129.760 byte) gönderici düğümün içine gömmek denendi, ancak Z1 platformunun flash sınırı nedeniyle şu hata alındı:
 
 ```
 program too large
 ```
 
-Bunun nedeni ELF dosyasının büyük bölümünün debug sembolleri ve sembol tablosundan oluşmasıdır. Gerçek çalıştırılabilir içerik yaklaşık 72 KB'dır. Bu nedenle aşağıdaki adımlar izlenmiştir:
+Bunun üzerine firmware ELF dosyası binary formata dönüştürüldü ve ilk 4096 byte'lık kısım kullanılarak OTA mekanizması test edildi:
 
-**1. ELF'ten ham binary üretildi:**
 ```bash
 msp430-objcopy -O binary new-firmware.z1 firmware.bin
-# Sonuç: 72.056 byte
-```
-
-**2. İlk 4096 byte alındı:**
-```bash
 dd if=firmware.bin of=firmware_chunk.bin bs=1 count=4096
-```
-
-**3. Hex dizisine dönüştürüldü:**
-```bash
 xxd -i firmware_chunk.bin | sed 's/firmware_chunk_bin/firmware_payload/g' > firmware_data.h
 ```
 
-Üretilen dizide `static const uint8_t` kullanılması kritik önem taşımaktadır. `const` niteleyicisi olmadan dizi RAM'e yerleşir ve şu hata alınır:
+Üretilen dizide `static const uint8_t` kullanmak zorunluydu; aksi durumda dizi RAM'e yerleşiyor ve şu hata alınıyordu:
 
 ```
 region `ram' overflowed by 2184 bytes
 ```
 
-`const` ile dizi flash'a yerleşir ve sorun çözülür.
-
 ---
 
 ## Gönderim Protokolü
 
-Firmware verisi 64 byte'lık bloklara bölünmüştür. Her blok için şu adımlar uygulanır:
-
-1. Blok verisi pakete kopyalanır
-2. Paket üzerinden CRC-16 hesaplanır
-3. UDP ile alıcıya gönderilir
-4. ACK beklenir; gelmezse yeniden iletilir
-
-```c
-#define OTA_BLOCK_SIZE    64
-#define OTA_MAX_RETRIES   5
-#define OTA_RETRY_INTERVAL (CLOCK_SECOND * 2)
+```
+#define OTA_BLOCK_SIZE     64
+#define OTA_MAX_RETRIES     5
+#define OTA_RETRY_INTERVAL  (CLOCK_SECOND * 2)
 ```
 
-Başlangıçta bekleme süresi 5 saniye olarak ayarlanmıştı. 64 blok × 5 saniye = 320 saniye, sunucunun 300 saniyelik zaman aşımını aşıyordu ve blok 45'ten sonra transfer kesiliyordu. Bekleme süresi 2 saniyeye indirilince sorun çözüldü.
-
-**Yeniden iletim akışı:**
+Her blok için akış şu şekilde işler:
 
 ```
-Gönderici                        Alıcı
-    |                               |
-    |---[block_id, data, CRC-16]--->|
-    |                               | CRC-16 doğrula
-    |<----------[ACK]---------------|
-    |                               |
-    | (CRC hatalıysa)               |
-    |<----------[NACK]--------------|
-    |                               |
-    | (5 denemede ACK gelmezse)     |
-    | → transfer durdurulur         |
+Gönderici                   Alıcı
+    |                          |
+    |---[block_id, data, CRC]->|
+    |                          | CRC-16 doğrula
+    |<--------[ACK]------------|
+    |                          |
+    | (hata varsa)             |
+    |<--------[NACK]-----------|
+    | → aynı blok tekrar gönderilir (max 5 deneme)
 ```
+
+Başlangıçta bekleme süresi 5 saniye olarak ayarlanmıştı. 64 blok × 5 saniye = 320 saniye, sunucunun 300 saniyelik zaman aşımını geçiyordu ve blok 45'ten itibaren transfer kesiliyordu. Süre 2 saniyeye indirilerek sorun çözüldü.
 
 ---
 
 ## Bütünlük Doğrulaması
 
-Projede iki ayrı katmanda bütünlük kontrolü uygulanmıştır:
+İki ayrı katmanda bütünlük kontrolü yapılmaktadır:
 
-### CRC-16 — Blok Doğrulama
-
-Her blok gönderilmeden önce CRC-16/CCITT algoritmasıyla hesaplanır. Alıcı gelen paketi aynı algoritmayla kontrol eder; uyuşmazlık varsa NACK gönderir.
-
-```c
-static inline uint16_t ota_crc16(const uint8_t *buf, uint16_t len) {
-    uint16_t crc = 0xFFFF;
-    for (i = 0; i < len; i++) {
-        crc ^= (uint16_t)buf[i] << 8;
-        for (bit = 0; bit < 8; bit++) {
-            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-            else              crc <<= 1;
-        }
-    }
-    return crc;
-}
-```
-
-### CRC-32 — İmaj Doğrulama
-
-Tüm bloklar alındıktan sonra, kaydedilen dosya baştan sona okunarak CRC-32 hesaplanır. Bu değer, gönderici tarafından iletilen beklenen değerle karşılaştırılır. Uyuşmazlık varsa dosya silinir.
-
-```c
-static uint32_t crc32_update(uint32_t crc, const uint8_t *buf, uint16_t len) {
-    crc = ~crc;
-    for (i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (bit = 0; bit < 8; bit++) {
-            if (crc & 1u) crc = (crc >> 1) ^ 0xEDB88320u;
-            else          crc >>= 1;
-        }
-    }
-    return ~crc;
-}
-```
+- **CRC-16** — Her blok gönderilmeden önce hesaplanır, alıcı tarafında doğrulanır. Uyuşmazlık varsa NACK gönderilir.
+- **CRC-32** — Tüm bloklar alındıktan sonra kaydedilen dosya baştan sona okunarak doğrulanır. Uyuşmazlık varsa dosya silinir.
 
 ---
 
-## Kalıcı Depolama — Coffee File System (CFS)
+## Depolama
 
-Alıcı düğüm, gelen blokları Contiki-NG'nin Coffee dosya sistemi (CFS) aracılığıyla `firmware.bin` adlı dosyaya yazar.
+Alıcı düğüm gelen blokları Contiki-NG'nin Coffee dosya sistemi (CFS) aracılığıyla `firmware.bin` adlı dosyaya yazar:
 
 ```c
-cfs_fd = cfs_open(OTA_FILENAME, CFS_WRITE);
-
-// Her blok geldiğinde:
-written = cfs_write(cfs_fd, work.data, work.length);
-
-// Transfer tamamlandığında:
+cfs_fd = cfs_open("firmware.bin", CFS_WRITE);
+cfs_write(cfs_fd, work.data, work.length);
 cfs_close(cfs_fd);
 ```
 
@@ -183,18 +124,12 @@ cfs_close(cfs_fd);
 
 ## Simülasyon Sonucu
 
-Cooja simülatöründe gerçekleştirilen testte 64 blokun tamamı kayıpsız iletilmiş, CRC-32 doğrulaması geçilmiş ve firmware CFS'e kalıcı olarak kaydedilmiştir:
-
 ```
-[INFO: App] Firmware array: 4096 byte, 64 blok
-[INFO: App] [0/64]  TX len=64 deneme=1
-[INFO: App] Blok 0 OK | 64 byte
-...
-[INFO: App] [63/64] TX len=64 deneme=1
-[INFO: App] Blok 63 OK | 4096 byte
-[INFO: App] === OTA TAMAMLANDI ===
-[INFO: App] DONE alindi.
-[INFO: App] === IMAJ DOGRULAMA ===
-[INFO: App] Yuklenmeye hazir yeni firmware alimi tamamlandi.
-[INFO: App] Dosya: firmware.bin  Boyut: 4096  CRC32: 0x9BDCF5EF
+Firmware size : 4096 byte
+Block size    : 64 byte
+Total blocks  : 64
+
+✓ Tüm bloklar alındı
+✓ CRC32 doğrulaması geçildi (0x9BDCF5EF)
+✓ firmware.bin başarıyla yazıldı
 ```
