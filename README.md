@@ -1,4 +1,4 @@
-# BIL304 — OTA Firmware Projesi
+# BIL304 — OTA Firmware Güncelleme Projesi
 
 ## Demo Videosu
 
@@ -7,24 +7,28 @@
 ---
 
 ## Proje Hakkında
-
-Bu projede Contiki-NG ve Cooja kullanılarak Z1 düğümleri arasında OTA (Over-The-Air) firmware güncelleme mekanizması geliştirildi. Simülasyonda üç düğüm kullanıldı:
-
-- Node 1: Alıcı ve RPL ağ kökü (udp-server.z1)
-- Node 2: Gönderici (udp-client.z1)
-- Node 3: Yönlendirici / komşu düğüm (udp-client.z1)
-
-Node 2 ve Node 3 aynı firmware ile çalışıyor. Ancak `node_id` kontrolü sayesinde sadece Node 2 OTA gönderimini başlatıyor:
-
+ 
+Contiki-NG ve Cooja kullanılarak Z1 düğümleri arasında OTA firmware aktarım mekanizması geliştirildi. Üç düğümlü bir simülasyon kuruldu:
+ 
+- **Node 1** → Alıcı, RPL ağ kökü (udp-server.z1)
+- **Node 2** → Gönderici (udp-client.z1)
+- **Node 3** → Komşu / yönlendirici (udp-client.z1)
+Node 2 ve Node 3'e aynı firmware yüklenmektedir. Aynı firmware kullanılmasına rağmen `node_id` kontrolü sayesinde yalnızca Node 2 OTA göndericisi olarak çalışmaktadır:
+ 
 ```c
 if(node_id == 2) {
     total_blocks = (FIRMWARE_PAYLOAD_LEN + OTA_BLOCK_SIZE - 1) / OTA_BLOCK_SIZE;
-    // OTA gönderim burada başlıyor
+    // OTA gönderim buradan başlar
 }
-Paket Yapısı
+```
+ 
+---
 
-OTA haberleşmesinde sabit boyutlu bir paket yapısı kullanıldı. Bu yapı ota_packet.h içinde tanımlı:
-
+## Paket Formatı
+ 
+Her OTA paketi `ota_packet.h` içinde tanımlanmış sabit boyutlu bir yapı taşır:
+ 
+```c
 typedef struct __attribute__((packed)) {
     uint8_t  type;
     uint16_t block_id;
@@ -32,64 +36,94 @@ typedef struct __attribute__((packed)) {
     uint8_t  data[OTA_BLOCK_SIZE];
     uint16_t checksum;
 } ota_packet_t;
-type: Paket türü (DATA, ACK, NACK, DONE)
-block_id: Veri bloğunun numarası
-length: Veri uzunluğu
-data: Firmware verisi
-checksum: CRC-16 kontrol değeri
-Firmware Hazırlama Süreci
+```
+ 
+- `type` → DATA, ACK, NACK veya DONE
+- `block_id` → Blok numarası
+- `length` → Veri uzunluğu
+- `data` → Firmware verisi (64 byte)
+- `checksum` → CRC-16 değeri
+---
 
-Başta tüm firmware dosyası doğrudan gönderilmeye çalışıldı ancak Z1 platformunun flash sınırı nedeniyle:
+## Firmware Hazırlama
 
+Başlangıçta `new-firmware.z1` dosyasının tamamını (129.760 byte) gönderici düğümün içine gömmek denendi, ancak Z1 platformunun flash sınırı nedeniyle şu hata alındı:
+
+```
 program too large
+```
 
-hatası alındı.
+Bunun üzerine firmware ELF dosyası binary formata dönüştürüldü ve ilk 4096 byte'lık kısım kullanılarak OTA mekanizması test edildi:
 
-Bu yüzden firmware binary’e çevrilip sadece ilk 4096 byte kullanıldı:
-
+```bash
 msp430-objcopy -O binary new-firmware.z1 firmware.bin
 dd if=firmware.bin of=firmware_chunk.bin bs=1 count=4096
-xxd -i firmware_chunk.bin > firmware_data.h
+xxd -i firmware_chunk.bin | sed 's/firmware_chunk_bin/firmware_payload/g' > firmware_data.h
+```
 
-Burada veriyi static const uint8_t olarak tutmak gerekiyordu. Aksi halde RAM taşması oluşuyordu:
+Üretilen dizide `static const uint8_t` kullanmak zorunluydu; aksi durumda dizi RAM'e yerleşiyor ve şu hata alınıyordu:
 
-region `ram' overflowed
-Gönderim Mantığı
+```
+region `ram' overflowed by 2184 bytes
+```
 
-OTA aktarımı bloklar halinde yapılır:
+---
 
+## Gönderim Protokolü
+
+```
 #define OTA_BLOCK_SIZE     64
 #define OTA_MAX_RETRIES     5
 #define OTA_RETRY_INTERVAL  (CLOCK_SECOND * 2)
+```
 
-Akış şu şekildedir:
+Her blok için akış şu şekilde işler:
 
-Gönderici paketi yollar
-Alıcı CRC-16 kontrolü yapar
-Doğruysa ACK gönderir
-Hatalıysa NACK gönderir
-Gönderici aynı bloğu tekrar yollar (max 5 deneme)
+```
+Gönderici                   Alıcı
+    |                          |
+    |---[block_id, data, CRC]->|
+    |                          | CRC-16 doğrula
+    |<--------[ACK]------------|
+    |                          |
+    | (hata varsa)             |
+    |<--------[NACK]-----------|
+    | → aynı blok tekrar gönderilir (max 5 deneme)
+```
 
-Başlangıçta 5 saniye olan bekleme süresi toplam transfer süresini 300 saniyeyi aştığı için bağlantı kesiliyordu. Bu yüzden 2 saniyeye düşürüldü ve problem çözüldü.
+Başlangıçta bekleme süresi 5 saniye olarak ayarlanmıştı. 64 blok × 5 saniye = 320 saniye, sunucunun 300 saniyelik zaman aşımını geçiyordu ve blok 45'ten itibaren transfer kesiliyordu. Süre 2 saniyeye indirilerek sorun çözüldü.
 
-Veri Bütünlüğü
+---
 
-İki aşamalı kontrol kullanıldı:
+## Bütünlük Doğrulaması
 
-CRC-16: Her blok için kontrol edilir, hata varsa tekrar gönderim yapılır
-CRC-32: Tüm firmware indirildikten sonra dosya bütünlüğü doğrulanır
-Dosya Kaydetme
+İki ayrı katmanda bütünlük kontrolü yapılmaktadır:
 
-Alıcı düğüm gelen veriyi Contiki-NG Coffee File System (CFS) ile diske yazar:
+- **CRC-16** — Her blok gönderilmeden önce hesaplanır, alıcı tarafında doğrulanır. Uyuşmazlık varsa NACK gönderilir.
+- **CRC-32** — Tüm bloklar alındıktan sonra kaydedilen dosya baştan sona okunarak doğrulanır. Uyuşmazlık varsa dosya silinir.
 
+---
+
+## Depolama
+
+Alıcı düğüm gelen blokları Contiki-NG'nin Coffee dosya sistemi (CFS) aracılığıyla `firmware.bin` adlı dosyaya yazar:
+
+```c
 cfs_fd = cfs_open("firmware.bin", CFS_WRITE);
 cfs_write(cfs_fd, work.data, work.length);
 cfs_close(cfs_fd);
-Simülasyon Sonucu
+```
+
+---
+
+## Simülasyon Sonucu
+
+```
 Firmware size : 4096 byte
 Block size    : 64 byte
 Total blocks  : 64
 
 ✓ Tüm bloklar alındı
-✓ CRC32 doğrulaması başarılı (0x9BDCF5EF)
-✓ firmware.bin oluşturuldu
+✓ CRC32 doğrulaması geçildi (0x9BDCF5EF)
+✓ firmware.bin başarıyla yazıldı
+```
